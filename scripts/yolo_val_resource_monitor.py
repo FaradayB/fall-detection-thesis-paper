@@ -1,30 +1,25 @@
 #!/usr/bin/env python3
 """
-YOLO Validation Resource Monitor (Ultralytics YOLOv8/YOLO11)
------------------------------------------------------------
-What it does:
-- Hooks into Ultralytics validation via callbacks.
-- Measures per-batch inference time (ms), total validation wall time (s).
-- Tracks CPU% (process & system), RAM (process RSS), system RAM%.
-- Tracks GPU utilization% and VRAM usage via NVIDIA NVML (if available).
-- Also records PyTorch peak CUDA memory (allocated & reserved).
+Basically the same idea as the other YOLO monitor script, but this one runs
+a single validation pass on one model instead of sweeping across learning
+rates. I hook into Ultralytics' validation callbacks to grab per-batch
+inference time, total wall time, CPU/RAM usage, and GPU utilization/VRAM
+through NVML when it's available, plus PyTorch's own peak CUDA memory
+counters.
 
-Outputs:
-- yolo_val_metrics/resource_summary.json  -> resource & timing summary
-- yolo_val_metrics/metrics.csv            -> Ultralytics validation metrics (mAP, precision, recall, etc.)
+Results land in yolo_val_metrics/: resource_summary.json for the resource
+and timing numbers, metrics.csv for whatever Ultralytics reports (mAP,
+precision, recall, etc.).
 
-Usage:
-1) Install deps (example):
-   pip install ultralytics psutil pynvml pandas
-   # and the correct torch/torchvision for your CUDA
-2) Edit the USER CONFIG at the bottom, then run:
-   python yolo_val_resource_monitor.py
+To run: install ultralytics, psutil, pynvml, pandas (and torch/torchvision
+for the right CUDA version), edit the config block near the bottom, then
+just run the file directly.
 
-Notes:
-- GPU utilization requires NVIDIA + NVML (pynvml). If unavailable, the script still runs and
-  will fall back to torch.cuda memory stats where possible.
-- "Inference time per batch" reflects the time between on_val_batch_start and on_val_batch_end
-  in Ultralytics' validation loop (includes model forward & NMS for that batch).
+One thing worth noting: without an NVIDIA GPU + NVML installed, GPU
+utilization just won't be tracked, but the script still runs fine and
+falls back to torch's own CUDA memory stats. Also, "inference time per
+batch" is measured between Ultralytics' on_val_batch_start and
+on_val_batch_end, so it includes the forward pass and NMS for that batch.
 """
 
 import os
@@ -45,12 +40,14 @@ try:
 except Exception:
     _NVML_READY = False
 
-# --- Helpers -----------------------------------------------------------------
+# A few small helper functions before the actual callback class.
 
 _PROC = psutil.Process(os.getpid())
 
 def _prime_cpu_percent_samplers():
-    # Prime samplers so first reading isn't 0.0
+    # psutil's cpu_percent() returns 0.0 the very first time you call it,
+    # so we call it once here just to "warm it up" before we start relying
+    # on it for real readings.
     try:
         _PROC.cpu_percent(None)
     except Exception:
@@ -106,7 +103,7 @@ def update_gpu_maxima(max_gpu_util, max_gpu_mem_used):
             except Exception:
                 pass
 
-# --- Callback collector ------------------------------------------------------
+# The class Ultralytics actually calls into during validation.
 
 class ValResourceCallback:
     def __init__(self):
@@ -209,7 +206,7 @@ class ValResourceCallback:
         }
         print(json.dumps(self.summary, indent=2))
 
-# --- Runner ------------------------------------------------------------------
+# Ties everything together: loads the model, runs val(), writes the files.
 
 def run_validation_with_metrics(model_path, data_yaml, imgsz=640, batch=16, device=0, half=True, workers=4, project_dir="yolo_val_metrics"):
     from ultralytics import YOLO
@@ -256,20 +253,16 @@ def run_validation_with_metrics(model_path, data_yaml, imgsz=640, batch=16, devi
     print(f"\nSaved results to: {out_dir.resolve()}")
     return cb.summary
 
-# --- Entry point -------------------------------------------------------------
-
 if __name__ == "__main__":
-    # ====== USER CONFIG (edit these) ======
-    MODEL_PATH = "yolov8n.pt"      # path to your trained weights (.pt)
-    DATA_YAML  = "caucafall.yaml"  # path to your dataset YAML
+    # Edit these to point at the model/dataset you actually want to validate.
+    MODEL_PATH = "yolov8n.pt"      # trained weights (.pt)
+    DATA_YAML  = "caucafall.yaml"  # dataset config
     IMGSZ      = 640
     BATCH      = 16
-    DEVICE     = 0                 # e.g., 0 for first GPU, or "cpu"
-    HALF       = True              # use half precision on supported GPUs
+    DEVICE     = 0                 # 0 for first GPU, or "cpu"
+    HALF       = True              # half precision, only matters on GPU
     WORKERS    = 4
-    # =====================================
 
-    # Run validation with resource monitoring
     run_validation_with_metrics(
         model_path=MODEL_PATH,
         data_yaml=DATA_YAML,
