@@ -1,0 +1,18 @@
+# Training run outputs (checkpoints, plots, logs) - regenerate via scripts/notebooks
+runs/
+runs_2/
+val_logs/
+
+# Model weights
+*.pt
+*.pth
+*.weights
+
+# Python
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
+Thumbs.db
