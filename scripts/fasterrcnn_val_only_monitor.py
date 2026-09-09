@@ -1,21 +1,16 @@
 #!/usr/bin/env python3
 """
-Faster R-CNN Validation-Only Resource Monitor
----------------------------------------------
-- NO TRAINING. This script runs validation on a torchvision Faster R-CNN model using your
-  VOCLikeDataset setup, and captures:
-    * per-batch inference time (ms)
-    * total validation wall time (s)
-    * process CPU% / RAM (MB), system CPU% / RAM%
-    * GPU util% and VRAM used (MB) via NVML (if available)
-    * torch CUDA peak memory (allocated/reserved)
+Same idea as the YOLO monitor scripts, except this one is for the torchvision
+Faster R-CNN model and my own VOC-style dataset loader (VOCLikeDataset below).
+No training happens here, it just loads the already-trained model and runs
+validation while keeping track of per-batch inference time, total wall time,
+CPU/RAM, and GPU usage (through NVML if it's installed) plus PyTorch's peak
+CUDA memory.
 
-- Saves:
-  runs/train/Faster_R-CNN_Optimized/val_monitor/resource_summary.json
-  runs/train/Faster_R-CNN_Optimized/val_monitor/metrics.csv
+Everything gets written to runs/train/Faster_R-CNN_Optimized/val_monitor/,
+as resource_summary.json and metrics.csv.
 
-Prereqs:
-  pip install psutil pynvml pandas torchmetrics tqdm
+Needs: psutil, pynvml, pandas, torchmetrics, tqdm (plus torch/torchvision).
 """
 
 import os
@@ -48,9 +43,7 @@ try:
 except Exception:
     _NVML_READY = False
 
-# =========================
-# CONFIG (edit as needed)
-# =========================
+# Config - change these if the dataset or class names change.
 
 CLASS_NAMES = ["fall", "no_fall"]
 CLASS_MAP = {name.lower().replace(" ", "_"): idx + 1 for idx, name in enumerate(CLASS_NAMES)}
@@ -78,9 +71,11 @@ WEIGHTS_PATH = 'runs/train/Faster_R-CNN_Optimized/model_final.pt'  # set to None
 RUN_DIR = Path('runs/train/Faster_R-CNN_Optimized')
 VAL_OUT_DIR = RUN_DIR / 'val_monitor'
 
-# =========================
-# Dataset & transforms
-# =========================
+# Dataset and transforms.
+#
+# This dataset expects Pascal VOC-style XML annotations sitting next to each
+# image (one .xml per image, same filename). It's a pretty simple loader,
+# just reads the boxes and labels out of the XML and hands back a tensor.
 
 def get_transform():
     return T.Compose([T.Resize((INPUT_SIZE, INPUT_SIZE)), T.ToTensor()])
@@ -118,7 +113,8 @@ class VOCLikeDataset(torch.utils.data.Dataset):
                     float(b.find('ymax').text)
                 ])
         except Exception as e:
-            # missing/invalid xml -> empty targets
+            # if the xml is missing or broken for some reason, just treat
+            # this image as having no annotations rather than crashing
             pass
         
         if self.transforms:
@@ -130,9 +126,7 @@ class VOCLikeDataset(torch.utils.data.Dataset):
         }
         return img, target
 
-# =========================
-# Resource monitoring utils
-# =========================
+# Resource monitoring helpers - same pattern as in the YOLO monitor scripts.
 
 _PROC = psutil.Process(os.getpid())
 
@@ -191,14 +185,12 @@ def update_gpu_maxima(max_gpu_util, max_gpu_mem_used):
             except Exception:
                 pass
 
-# =========================
-# Validation with monitor
-# =========================
+# The actual validation loop, with resource tracking mixed in.
 
 def validate_with_monitor(model, loader, device):
-    """
-    Validates the model and records resource/timing stats.
-    Returns resource_summary (dict) and metrics dict (precision, recall, mAP50, mAP50-95).
+    """Run the model over the validation set and work out both how good it is
+    (precision, recall, mAP50, mAP50-95) and how heavy it was to run
+    (timing, CPU/RAM, GPU). Returns (resource_summary, metrics) as two dicts.
     """
     model.eval()
     if torch.cuda.is_available():
@@ -233,7 +225,7 @@ def validate_with_monitor(model, loader, device):
             imgs = [img.to(device) for img in imgs]
             targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
 
-            # ----------------- Timed inference -----------------
+            # This is the part we actually time - the real eval forward pass.
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
             t0 = time.perf_counter()
@@ -243,8 +235,10 @@ def validate_with_monitor(model, loader, device):
             dt = time.perf_counter() - t0
             batch_times.append(dt)
 
-            # ----------------- Optional: compute val "loss" (not timed) -----------------
-            # Switch briefly to train mode to get losses, then back to eval
+            # torchvision's Faster R-CNN only returns loss values in train mode,
+            # so to get a validation loss we have to flip to train() briefly,
+            # run the same batch again, then flip back. Not timed since it's
+            # not part of the "real" inference cost.
             model.train()
             loss_dict = model(imgs, targets)
             model.eval()
@@ -254,7 +248,7 @@ def validate_with_monitor(model, loader, device):
             sum_d   += float(loss_dict.get('loss_objectness', 0.0)) + float(loss_dict.get('loss_rpn_box_reg', 0.0))
             count += 1
 
-            # --------------- Metrics update --------------------
+            # Now update the accuracy metrics with this batch's predictions.
             for out, tgt in zip(outputs, targets):
                 keep = out['scores'] > SCORE_THRESHOLD
                 pred = {
@@ -269,7 +263,8 @@ def validate_with_monitor(model, loader, device):
                 pb, pl, ps = pred['boxes'].cpu(), pred['labels'].cpu(), pred['scores'].cpu()
                 gb, gl = gt['boxes'].cpu(), gt['labels'].cpu()
 
-                # simple matching for per-sample PR bookkeeping
+                # Match each predicted box to the closest ground-truth box by IoU,
+                # so we can label it as a true positive or false positive below.
                 ious = box_iou(pb, gb) if (len(pb) and len(gb)) else None
                 gt_used = set()
                 for i in range(len(pb)):
@@ -288,7 +283,7 @@ def validate_with_monitor(model, loader, device):
                     if j not in gt_used:
                         all_p.append(0); all_t.append(int(gl[j].item())); all_s.append(0.0)
 
-            # --------------- Resource snapshots per batch ------
+            # Grab a resource snapshot after every batch too.
             p_cpu, rss_mb, sys_cpu, sys_mem = get_cpu_ram_snapshot()
             if rss_mb is not None:
                 max_proc_ram_mb = max(max_proc_ram_mb, rss_mb)
@@ -324,7 +319,7 @@ def validate_with_monitor(model, loader, device):
     losses = {
         'box': (sum_box / count) if count else None,
         'cls': (sum_cls / count) if count else None,
-        'dfl': (sum_d  / count) if count else None,  # dfl = objectness + rpn_box_reg (naming for compatibility with your tables)
+        'dfl': (sum_d  / count) if count else None,  # calling it "dfl" here just so it lines up with the YOLO results tables - it's really objectness + rpn_box_reg loss
     }
     metrics = {'precision': precision, 'recall': recall, 'mAP50': res50, 'mAP50-95': res_all}
 
@@ -357,11 +352,11 @@ def validate_with_monitor(model, loader, device):
     }
     return summary, metrics
 
-# =========================
-# Main
-# =========================
+# Main entry point below.
 
 def build_model(num_classes):
+    # Start from the standard pretrained Faster R-CNN, then swap out just the
+    # classification head so it predicts our own classes instead of COCO's.
     model = fasterrcnn_resnet50_fpn(weights='DEFAULT')
     in_features = model.roi_heads.box_predictor.cls_score.in_features
     model.roi_heads.box_predictor = FastRCNNPredictor(in_features, num_classes)
@@ -386,13 +381,16 @@ def main():
     if WEIGHTS_PATH and Path(WEIGHTS_PATH).exists():
         print(f"Loading weights: {WEIGHTS_PATH}")
         sd = torch.load(WEIGHTS_PATH, map_location=DEVICE)
-        # Handle both state_dict-only and checkpoint dicts
+        # Depending on how the checkpoint was saved, it's either a raw
+        # state_dict, or a dict with the state_dict tucked under 'model'.
+        # This just handles both cases so I don't have to remember which
+        # one I used when I trained it.
         if isinstance(sd, dict) and all(k.startswith('backbone.') or 'roi_heads' in k or 'rpn' in k for k in sd.keys()):
             model.load_state_dict(sd, strict=False)
         elif isinstance(sd, dict) and 'model' in sd:
             model.load_state_dict(sd['model'], strict=False)
         else:
-            # try direct
+            # last resort, just try loading it directly
             try:
                 model.load_state_dict(sd, strict=False)
             except Exception as e:
