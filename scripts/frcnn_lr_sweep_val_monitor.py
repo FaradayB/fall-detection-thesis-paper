@@ -1,23 +1,22 @@
 #!/usr/bin/env python3
 """
-Faster R-CNN LR Sweep + Validation Resource Monitor
----------------------------------------------------
-- Mirrors your Faster R-CNN training pipeline.
-- Loops over LEARNING_RATES = [0.1, 0.01, 0.001].
-- After each training run, executes a monitored validation pass that records:
-    * per-batch inference time (ms)
-    * total validation wall time (s)
-    * process CPU% / RAM (MB), system CPU% / RAM%
-    * GPU utilization% and VRAM used (MB) via NVML if available
-    * torch CUDA peak memory (allocated/reserved)
-- Saves per-run files under: runs_2/train/FRCNN_noD_Normal_lr.<lr>/val_monitor/
-    - resource_summary.json
-    - metrics.csv  (precision/recall/mAP50/mAP50-95 + losses)
-- Aggregates a CSV across all learning rates:
-    runs_2/train/val_monitor_summary_FRCNN.csv
+This is the full Faster R-CNN pipeline: for each learning rate in
+LEARNING_RATES it trains the model from scratch, validates it every epoch
+(recording resource usage the whole time), applies early stopping on mAP50,
+and once training is done it generates the usual set of plots (confusion
+matrix, F1/precision/recall vs. confidence, PR curve, label distribution,
+and a results panel across epochs).
 
-Prereqs:
-  pip install torch torchvision psutil pynvml torchmetrics pandas tqdm pillow matplotlib scipy
+The resource monitoring records the same stuff as the other scripts here:
+per-batch inference time, total validation time, CPU/RAM, GPU utilization
+and VRAM through NVML, and PyTorch's peak CUDA memory.
+
+Each run gets resource_summary.json and metrics.csv under
+runs_2/train/FRCNN_noD_Normal_lr.<lr>/val_monitor/, and once every LR is
+done, everything gets combined into runs_2/train/val_monitor_summary_FRCNN.csv.
+
+Needs: torch, torchvision, psutil, pynvml, torchmetrics, pandas, tqdm,
+pillow, matplotlib, scipy.
 """
 
 import os
@@ -55,9 +54,7 @@ try:
 except Exception:
     _NVML_READY = False
 
-# ============================================================================
-# CONFIGURATION
-# ============================================================================
+# Config - the knobs I actually turn between experiments.
 
 CLASS_NAMES = ["fall", "no_fall"]
 CLASS_MAP = {name.lower().replace(" ", "_"): idx + 1 for idx, name in enumerate(CLASS_NAMES)}
@@ -82,9 +79,7 @@ DATASET_BASE = 'dataset_paper_new'
 PROJECT_DIR = Path('runs_2/train')
 NAME_PREFIX = 'FRCNN_noD_Normal_lr'
 
-# ============================================================================
-# DATASET
-# ============================================================================
+# Dataset loader, reading Pascal VOC-style XML annotations.
 
 def get_transform():
     return T.Compose([T.Resize((INPUT_SIZE, INPUT_SIZE)), T.ToTensor()])
@@ -121,7 +116,8 @@ class VOCLikeDataset(torch.utils.data.Dataset):
                     float(b.find('ymax').text)
                 ])
         except Exception:
-            # If label missing/corrupt, return empty targets
+            # if the xml is missing or malformed, just treat this image as
+            # having no annotated objects instead of crashing the whole run
             boxes, labels = [], []
 
         if self.transforms:
@@ -133,9 +129,9 @@ class VOCLikeDataset(torch.utils.data.Dataset):
         }
         return img, target
 
-# ============================================================================
-# RESOURCE MONITORING
-# ============================================================================
+# Resource monitoring - tracks CPU, RAM, and GPU usage during validation.
+# Same pattern as the other scripts, just packaged as a class here since
+# torchvision doesn't have a callback system like Ultralytics does.
 
 _PROC = psutil.Process(os.getpid())
 
@@ -290,15 +286,13 @@ class ValResourceMonitor:
         }
         return self.summary
 
-# ============================================================================
-# VALIDATION (metrics + monitoring)
-# ============================================================================
+# Runs one full validation pass, computing both accuracy metrics and
+# resource usage at the same time, since we're already looping over batches.
 
 def validate_with_monitor(model, loader, device, save_dir, score_thresh=SCORE_THRESHOLD, iou_thresh=IOU_THRESHOLD):
-    """
-    Runs validation with metrics (precision, recall, mAP50, mAP50-95) and losses,
-    while monitoring resource usage and timing.
-    Saves results to save_dir/val_monitor/ as resource_summary.json and metrics.csv
+    """Validate the model: precision, recall, mAP50, mAP50-95, and losses,
+    plus the resource/timing numbers. Writes resource_summary.json and
+    metrics.csv into save_dir/val_monitor/.
     """
     save_dir = Path(save_dir)
     vm_dir = save_dir / 'val_monitor'
@@ -347,10 +341,12 @@ def validate_with_monitor(model, loader, device, save_dir, score_thresh=SCORE_TH
             imgs = [img.to(device) for img in imgs]
             targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
             
-            # Predictions
+            # Get the predictions first.
             outputs = model(imgs)
-            
-            # Losses (using the same forward signature with targets)
+
+            # torchvision only returns losses in train mode, so switch over
+            # briefly, run the same batch again just to get the loss values,
+            # then switch back to eval.
             model.train()
             loss_dict = model(imgs, targets)
             model.eval()
@@ -360,7 +356,7 @@ def validate_with_monitor(model, loader, device, save_dir, score_thresh=SCORE_TH
             sum_d += float(loss_dict.get('loss_objectness', 0.0)) + float(loss_dict.get('loss_rpn_box_reg', 0.0))
             count += 1
 
-            # Metrics
+            # Update the running accuracy metrics with this batch's predictions.
             for out, tgt in zip(outputs, targets):
                 keep = out['scores'] > score_thresh
                 pred = {'boxes': out['boxes'][keep], 'scores': out['scores'][keep], 'labels': out['labels'][keep]}
@@ -397,9 +393,9 @@ def validate_with_monitor(model, loader, device, save_dir, score_thresh=SCORE_TH
 
     return losses, metrics, summary, (all_t, all_p, all_s)
 
-# ============================================================================
-# PLOTTING HELPERS (unchanged from your style, optional usage)
-# ============================================================================
+# Plotting helpers below - these just turn the numbers above into the charts
+# I actually put in the thesis. All optional, training still works without
+# calling any of them.
 
 def create_confusion_matrix(y_true, y_pred, save_path, normalize=False):
     labels = list(range(1, NUM_CLASSES))
@@ -574,30 +570,27 @@ def create_results_panel(csv_file, save_path):
     fig.savefig(save_path, dpi=300, bbox_inches='tight')
     plt.close(fig)
 
-# ============================================================================
-# TRAIN + VALIDATE LOOP
-# ============================================================================
+# This is the actual training loop for one learning rate: trains epoch by
+# epoch, validates after each one, and stops early if mAP50 stalls.
 
 def train_and_validate_for_lr(lr0):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-    # Datasets and loaders
     train_ds = VOCLikeDataset(f"{DATASET_BASE}/images/train", f"{DATASET_BASE}/labels_voc/train", get_transform())
     val_ds = VOCLikeDataset(f"{DATASET_BASE}/images/val", f"{DATASET_BASE}/labels_voc/val", get_transform())
     train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, collate_fn=lambda x: tuple(zip(*x)))
     val_loader = DataLoader(val_ds, batch_size=VAL_BATCH_SIZE, shuffle=False, collate_fn=lambda x: tuple(zip(*x)))
 
-    # Model
+    # Same setup as build_model() in the other scripts - pretrained backbone,
+    # swap the head to predict our own classes.
     model = fasterrcnn_resnet50_fpn(weights='DEFAULT')
     in_features = model.roi_heads.box_predictor.cls_score.in_features
     model.roi_heads.box_predictor = FastRCNNPredictor(in_features, NUM_CLASSES)
     model.to(device)
 
-    # Optimizer & scheduler
     optimizer = torch.optim.SGD(model.parameters(), lr=lr0, momentum=MOMENTUM, weight_decay=WEIGHT_DECAY)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=NUM_EPOCHS)
 
-    # Save dir
     run_dir = PROJECT_DIR / f'{NAME_PREFIX}.{lr0}'
     run_dir.mkdir(parents=True, exist_ok=True)
     csv_file = run_dir / 'results.csv'
@@ -619,14 +612,15 @@ def train_and_validate_for_lr(lr0):
             model.train()
             t0 = time.time()
 
-            # Warmup
+            # Ramp the learning rate up gradually for the first few epochs
+            # instead of hitting it at full strength immediately - helps
+            # avoid the loss spiking right at the start of training.
             if epoch <= WARMUP_EPOCH:
                 warmup_lr = lr0 * (epoch / WARMUP_EPOCH)
                 for param_group in optimizer.param_groups:
                     param_group['lr'] = warmup_lr
                     param_group['momentum'] = 0.8
 
-            # Train epoch
             sum_box = sum_cls = sum_dfl = 0.0
             train_pbar = tqdm(train_loader, desc=f'LR {lr0} | Epoch {epoch}/{NUM_EPOCHS}')
             for imgs, targets in train_pbar:
@@ -645,20 +639,20 @@ def train_and_validate_for_lr(lr0):
                     'cls': f'{sum_cls/(train_pbar.n+1):.3f}'
                 })
 
-            # Average losses
             train_box = sum_box / max(1, len(train_loader))
             train_cls = sum_cls / max(1, len(train_loader))
             train_dfl = sum_dfl / max(1, len(train_loader))
             epoch_time = time.time() - t0
 
-            # Validation with monitoring
             val_losses, metrics, summary, (all_t, all_p, all_s) = validate_with_monitor(model, val_loader, device, run_dir)
 
-            # LRs
+            # Ultralytics logs three param-group LRs (pg0/pg1/pg2), so I'm
+            # matching that column layout here even though this optimizer
+            # really only has one LR - just repeat it if there aren't three.
             lrs = [group['lr'] for group in optimizer.param_groups]
             pg0, pg1, pg2 = (lrs + [lrs[-1]] * 3)[:3]
 
-            # Write row
+
             row = [
                 epoch, epoch_time,
                 train_box, train_cls, train_dfl,
@@ -678,11 +672,11 @@ def train_and_validate_for_lr(lr0):
 
             scheduler.step()
 
-            # Early stopping on mAP50
+            # Stop early if mAP50 hasn't improved in PATIENCE epochs, no point
+            # burning more GPU time once it's plateaued.
             if metrics['mAP50'] > best_map:
                 best_map = metrics['mAP50']
                 patience_counter = 0
-                # Save best weights
                 torch.save(model.state_dict(), run_dir / 'best.pt')
             else:
                 patience_counter += 1
@@ -690,10 +684,10 @@ def train_and_validate_for_lr(lr0):
                     print(f"Early stopping at epoch {epoch} for lr={lr0}")
                     break
 
-        # Final save
+        # Always keep the last epoch's weights too, even if it wasn't the best.
         torch.save(model.state_dict(), run_dir / 'last.pt')
 
-        # Optional: plots (using last validation preds)
+        # Generate the plots using predictions from the last validation pass.
         plot_dir = run_dir / 'plots'
         plot_dir.mkdir(exist_ok=True)
         create_confusion_matrix(all_t, all_p, plot_dir / 'confusion_matrix.png', normalize=False)
@@ -705,6 +699,8 @@ def train_and_validate_for_lr(lr0):
 
     return run_dir
 
+# Trains and validates every learning rate in the sweep, then builds one
+# combined CSV so I can compare them side by side.
 def main():
     PROJECT_DIR.mkdir(parents=True, exist_ok=True)
     agg_rows = []
@@ -712,7 +708,6 @@ def main():
     for lr in LEARNING_RATES:
         run_dir = train_and_validate_for_lr(lr)
 
-        # Load monitored metrics
         vm_dir = Path(run_dir) / 'val_monitor'
         metrics_csv = vm_dir / 'metrics.csv'
         summary_json = vm_dir / 'resource_summary.json'
