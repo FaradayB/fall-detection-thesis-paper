@@ -1,25 +1,21 @@
 #!/usr/bin/env python3
 """
-Faster R-CNN Validation-Only Resource Monitor
----------------------------------------------
-- NO TRAINING. Validates existing checkpoints for each LR in LEARNING_RATES.
-- Expects weights under:
-    runs_2/train/FRCNN_noD_Normal_lr.<lr> / weights file in WEIGHTS_PREFERENCE
-  where WEIGHTS_PREFERENCE = ["model_final.pt", "best.pt", "last.pt"]
+This is the Faster R-CNN version of the "validate only, sweep across learning
+rates" script. For every LR in LEARNING_RATES it looks for a checkpoint under
+runs_2/train/FRCNN_noD_Normal_lr.<lr>/ (trying model_final.pt, then best.pt,
+then last.pt), loads it, and validates it - no training happens here at all.
 
-What it records per LR:
-- per-batch inference time (ms), total validation wall time (s)
-- process CPU%, process RAM (MB), system CPU%, system RAM%
-- GPU utilization% & VRAM used (via NVML if available)
-- PyTorch peak CUDA memory (allocated/reserved)
-- mAP50, mAP50-95, precision, recall, and averaged val losses
+While validating, it tracks the same things as the other monitor scripts:
+per-batch inference time, total wall time, CPU/RAM, GPU usage through NVML,
+PyTorch's peak CUDA memory, plus the actual detection metrics (mAP50,
+mAP50-95, precision, recall) and the averaged validation losses.
 
-Outputs:
-- Per LR: runs_2/train/FRCNN_noD_Normal_lr.<lr>/val_monitor/{resource_summary.json, metrics.csv}
-- Aggregate: runs_2/train/val_monitor_summary_FRCNN_valonly.csv
+Each LR gets its own resource_summary.json and metrics.csv inside its
+val_monitor folder, and everything is also collected into one CSV:
+runs_2/train/val_monitor_summary_FRCNN_valonly.csv.
 
-Prereqs:
-  pip install torch torchvision psutil pynvml torchmetrics pandas tqdm pillow matplotlib scipy
+Needs: torch, torchvision, psutil, pynvml, torchmetrics, pandas, tqdm,
+pillow, matplotlib, scipy.
 """
 
 import os
@@ -52,7 +48,7 @@ try:
 except Exception:
     _NVML_READY = False
 
-# ----------------------- Config (edit as needed) -----------------------------
+# Config block - the values I actually change between runs.
 CLASS_NAMES = ["fall", "no_fall"]
 CLASS_MAP = {name.lower().replace(" ", "_"): idx + 1 for idx, name in enumerate(CLASS_NAMES)}
 NUM_CLASSES = len(CLASS_NAMES) + 1  # + background
@@ -66,9 +62,9 @@ DATASET_BASE = 'dataset_paper_new'
 PROJECT_DIR = Path('runs_2/train')
 NAME_PREFIX = 'FRCNN_noD_Normal_lr'
 LEARNING_RATES = [0.1, 0.01, 0.001]
-WEIGHTS_PREFERENCE = ["model_final.pt", "best.pt", "last.pt"]  # tried in order
+WEIGHTS_PREFERENCE = ["model_final.pt", "best.pt", "last.pt"]  # tried in this order
 
-# ----------------------- Dataset --------------------------------------------
+# Same VOC-style dataset loader used in the other Faster R-CNN script.
 def get_transform():
     return T.Compose([T.Resize((INPUT_SIZE, INPUT_SIZE)), T.ToTensor()])
 
@@ -110,7 +106,8 @@ class VOCLikeDataset(torch.utils.data.Dataset):
         }
         return img, target
 
-# ----------------------- Monitoring utils -----------------------------------
+# CPU/RAM/GPU monitoring helpers, written more compactly here than in the
+# other scripts but doing the exact same job.
 _PROC = psutil.Process(os.getpid())
 
 def _prime_cpu_percent_samplers():
@@ -160,6 +157,9 @@ def update_gpu_maxima(max_gpu_util, max_gpu_mem_used):
             except Exception:
                 pass
 
+# A small class version of the same monitor, just with start/on_batch_start/
+# on_batch_end/finish methods instead of Ultralytics-style callbacks, since
+# torchvision's Faster R-CNN doesn't have a built-in callback system.
 class ValResourceMonitor:
     def __init__(self):
         self.batch_times = []
@@ -234,11 +234,10 @@ class ValResourceMonitor:
         }
         return self.summary
 
-# ----------------------- Validation w/metrics --------------------------------
+# The actual validation loop - runs the model, scores it, and times it.
 def validate_with_monitor(model, loader, device, save_dir, score_thresh=SCORE_THRESHOLD, iou_thresh=IOU_THRESHOLD):
-    """
-    Validation with metrics & resource monitoring.
-    Writes: save_dir/val_monitor/{resource_summary.json, metrics.csv}
+    """Validate one model and write its resource_summary.json and metrics.csv
+    into save_dir/val_monitor/.
     """
     save_dir = Path(save_dir)
     vm_dir = save_dir / 'val_monitor'
@@ -252,6 +251,9 @@ def validate_with_monitor(model, loader, device, save_dir, score_thresh=SCORE_TH
     all_t, all_p, all_s = [], [], []
 
     def match_predictions(pred_boxes, pred_labels, pred_scores, gt_boxes, gt_labels, iou_thresh=0.5):
+        # Pairs up predictions with ground truth boxes by IoU overlap, so we
+        # can tell which predictions were correct, which were false alarms,
+        # and which ground-truth boxes got missed entirely.
         matches = []
         if len(pred_boxes) == 0:
             for j in range(len(gt_boxes)):
@@ -288,10 +290,11 @@ def validate_with_monitor(model, loader, device, save_dir, score_thresh=SCORE_TH
             imgs = [img.to(device) for img in imgs]
             targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
 
-            # Predictions
+            # Get the actual predictions first.
             outputs = model(imgs)
 
-            # Losses using training-style forward
+            # torchvision only gives you loss values in train mode, so switch
+            # over briefly to compute a validation loss on the same batch.
             model.train()
             loss_dict = model(imgs, targets)
             model.eval()
@@ -300,7 +303,7 @@ def validate_with_monitor(model, loader, device, save_dir, score_thresh=SCORE_TH
             sum_d += float(loss_dict.get('loss_objectness', 0.0)) + float(loss_dict.get('loss_rpn_box_reg', 0.0))
             count += 1
 
-            # Metrics accumulation
+            # Feed this batch's predictions into the running metrics.
             for out, tgt in zip(outputs, targets):
                 keep = out['scores'] > score_thresh
                 pred = {'boxes': out['boxes'][keep], 'scores': out['scores'][keep], 'labels': out['labels'][keep]}
@@ -319,7 +322,7 @@ def validate_with_monitor(model, loader, device, save_dir, score_thresh=SCORE_TH
 
     summary = monitor.finish()
 
-    # Compute final metrics
+    # Work out the final numbers now that all batches are done.
     res50 = float(mp50.compute()['map'].item())
     res_all = float(mp_all.compute()['map'].item())
     valid_labels = list(range(1, NUM_CLASSES))
@@ -335,9 +338,11 @@ def validate_with_monitor(model, loader, device, save_dir, score_thresh=SCORE_TH
 
     return losses, metrics, summary
 
-# ----------------------- Loader for weights ----------------------------------
+# Builds a fresh model and loads whichever checkpoint format it turns out to be.
 def build_model_and_load(weights_path, device):
-    """Build Faster R-CNN model and load state dict or full module from weights_path."""
+    """Build the Faster R-CNN model and load weights from weights_path,
+    handling a couple of different checkpoint formats I've saved things in.
+    """
     model = fasterrcnn_resnet50_fpn(weights='DEFAULT')
     in_features = model.roi_heads.box_predictor.cls_score.in_features
     model.roi_heads.box_predictor = FastRCNNPredictor(in_features, NUM_CLASSES)
@@ -346,15 +351,15 @@ def build_model_and_load(weights_path, device):
     state = torch.load(weights_path, map_location=device)
     loaded = False
 
-    # Try common patterns
+    # First just try treating it as a plain state_dict.
     if isinstance(state, dict):
-        # Case 1: pure state_dict
         try:
             model.load_state_dict(state)
             loaded = True
         except Exception:
             pass
-        # Case 2: checkpoint-like
+        # Didn't work, so maybe it's a checkpoint dict with the state_dict
+        # nested under one of these keys instead.
         if not loaded:
             for key in ('state_dict', 'model_state', 'model'):
                 if key in state and isinstance(state[key], dict):
@@ -371,7 +376,7 @@ def build_model_and_load(weights_path, device):
     model.eval()
     return model
 
-# ----------------------- Main -------------------------------------------------
+# Runs validation for every learning rate we have a checkpoint for.
 def main():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
@@ -390,7 +395,7 @@ def main():
             print(f"[SKIP] Run dir not found for lr={lr}: {run_dir}")
             continue
 
-        # Find a weights file
+        # Look for a usable weights file, in order of preference.
         weights_path = None
         for fname in WEIGHTS_PREFERENCE:
             candidate = run_dir / fname
@@ -398,7 +403,8 @@ def main():
                 weights_path = candidate
                 break
         if weights_path is None:
-            # Also check within 'weights' subdir in case user saved there
+            # Some of the older runs saved weights under a 'weights' subfolder
+            # instead of directly in the run directory, so check there too.
             for fname in WEIGHTS_PREFERENCE:
                 candidate = run_dir / "weights" / fname
                 if candidate.exists():
