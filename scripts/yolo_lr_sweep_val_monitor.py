@@ -1,30 +1,20 @@
 #!/usr/bin/env python3
 """
-YOLO LR Sweep + Validation Resource Monitor
--------------------------------------------
-- Mirrors the user's training settings (SGD, momentum, weight_decay, patience, etc.)
-- Trains for a list of learning rates.
-- After each training, validates the *best weights* with callbacks that capture:
-  * per-batch inference time (ms)
-  * total validation time (s)
-  * process CPU% / RAM (MB), system CPU% / RAM%
-  * GPU util% and VRAM used (MB) via NVML (if available)
-  * torch CUDA peak mem (allocated/reserved)
+This is the one that actually trains, unlike the "val only" scripts. It goes
+through my list of learning rates, trains a fresh YOLO model from scratch for
+each one (same SGD/momentum/weight_decay/patience settings I used for the
+real experiments), then validates the best checkpoint from that run while
+recording resource usage: per-batch inference time, total validation time,
+CPU/RAM, GPU util and VRAM via NVML, and PyTorch's peak CUDA memory.
 
-Outputs (per LR run):
-- <project>/<name>/val_monitor/resource_summary.json
-- <project>/<name>/val_monitor/metrics.csv
+Each learning rate ends up with its own val_monitor/resource_summary.json
+and metrics.csv inside its run folder, and they all get combined into one
+val_monitor_summary.csv at the end so I can compare LRs directly.
 
-Aggregate:
-- <project>/val_monitor_summary.csv (one row per LR)
-
-Prereqs:
-  pip install ultralytics psutil pynvml pandas
-  # + matching torch/torchvision for your CUDA
-
-Note:
-  - Works with Ultralytics YOLOv8/YOLO11.
-  - If NVML/pynvml not available, GPU util falls back to torch memory stats only.
+Needs ultralytics, psutil, pynvml, pandas, and torch/torchvision matching
+the CUDA version on the machine. Works with both YOLOv8 and YOLO11. If NVML
+isn't available it just falls back to torch's own memory stats for the GPU
+numbers, everything else still works.
 """
 
 import os
@@ -46,7 +36,7 @@ try:
 except Exception:
     _NVML_READY = False
 
-# ------------------ Callback for validation monitoring -----------------------
+# Resource-tracking callback, hooked into YOLO's validation step below.
 
 _PROC = psutil.Process(os.getpid())
 
@@ -204,7 +194,7 @@ class ValResourceCallback:
         }
 
 def run_validation_with_metrics(model_path, data_yaml, imgsz=640, batch=16, device=0, half=True, workers=4, out_dir="val_monitor"):
-    """Run Ultralytics model.val() with resource/timing callbacks, save to out_dir."""
+    """Validate one checkpoint and save its resource/timing/metrics files."""
     from ultralytics import YOLO
 
     cb = ValResourceCallback()
@@ -244,12 +234,12 @@ def run_validation_with_metrics(model_path, data_yaml, imgsz=640, batch=16, devi
 
     return cb.summary, out_dir
 
-# --------------------------- Main LR sweep runner ----------------------------
+# The actual sweep: train once per learning rate, then validate each one.
 
 def main():
     from ultralytics import YOLO
 
-    # ====== USER CONFIG (mirror your settings) ======
+    # These mirror the training settings from my actual experiments.
     DATA_YAML = "dataset_paper_new/data_nano_rev.yaml"
     EPOCHS = 100
     TRAIN_BATCH = 16
@@ -263,10 +253,9 @@ def main():
     PROJECT = "runs_2/train"
     NAME_PREFIX = "YOLO_noD_Reversed_lr"
     EXIST_OK = True
-    USE_HALF_FOR_VAL = True   # half-precision during validation if supported
+    USE_HALF_FOR_VAL = True   # half precision for validation, if the GPU supports it
 
     LEARNING_RATES = [0.1, 0.01, 0.001, 0.0001, 0.00001]
-    # =================================================
 
     project_dir = Path(PROJECT)
     project_dir.mkdir(parents=True, exist_ok=True)
@@ -277,7 +266,8 @@ def main():
         run_name = f"{NAME_PREFIX}.{lr}"
         print(f"\n=== Training with lr0={lr} -> name={run_name} ===\n")
 
-        # Fresh model each LR (recommended)
+        # Start from the pretrained checkpoint fresh for every LR, otherwise
+        # later runs would be building on whatever the previous LR learned.
         model = YOLO("yolov8n.pt")
 
         train_results = model.train(
@@ -296,17 +286,14 @@ def main():
             exist_ok=EXIST_OK,
         )
 
-        # Path to best weights produced by this run
+        # Grab whichever weights this run actually produced.
         run_dir = project_dir / run_name
         best_weights = run_dir / "weights" / "best.pt"
         if not best_weights.exists():
-            # Fallback to last.pt if best not present
             best_weights = run_dir / "weights" / "last.pt"
 
-        # Validation monitor output folder inside the same run
         val_out_dir = run_dir / "val_monitor"
 
-        # Run validation with monitoring
         summary, out_dir = run_validation_with_metrics(
             model_path=str(best_weights),
             data_yaml=DATA_YAML,
