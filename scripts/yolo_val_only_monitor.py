@@ -1,27 +1,17 @@
 #!/usr/bin/env python3
 """
-Validation-Only Resource Monitor for Ultralytics YOLO
-----------------------------------------------------
-- NO TRAINING. This script only runs validation on already-trained weights.
-- Based on your prior run layout:
-    runs_2/train/YOLO_noD_Reversed_lr.<lr>/weights/{best.pt|last.pt}
-- For each learning rate, loads the weights and runs `model.val()` with callbacks that capture:
-  * per-batch inference time (ms)
-  * total validation wall time (s)
-  * process CPU% / RAM (MB), system CPU% / RAM%
-  * GPU util% and VRAM used (MB) via NVML (if available)
-  * torch CUDA peak mem (allocated/reserved)
+This script does NOT train anything. It just loads weights I already trained
+for each learning rate (from the runs_2/train/YOLO_noD_Reversed_lr.<lr> folders)
+and runs YOLO's validation on them, while a set of callbacks quietly records
+how heavy each run was: per-batch inference time, total validation time, CPU
+and RAM usage, and GPU utilization / VRAM if NVML is available on the machine.
 
-Outputs (per LR run):
-- <project>/<name>/val_monitor/resource_summary.json
-- <project>/<name>/val_monitor/metrics.csv
+For every learning rate I get a resource_summary.json and metrics.csv inside
+that run's val_monitor folder, and at the end everything gets collected into
+one val_monitor_summary.csv so I can compare learning rates side by side.
 
-Aggregate:
-- <project>/val_monitor_summary.csv (one row per LR)
-
-Prereqs:
-  pip install ultralytics psutil pynvml pandas
-  # + matching torch/torchvision for your CUDA
+Needs: ultralytics, psutil, pynvml, pandas, plus torch/torchvision matching
+whatever CUDA version is installed.
 """
 
 import os
@@ -43,7 +33,9 @@ try:
 except Exception:
     _NVML_READY = False
 
-# ------------------ Callback for validation monitoring -----------------------
+# Below is the callback that hooks into YOLO's validation loop and collects
+# the resource numbers. Ultralytics fires these callbacks itself, I just
+# register them on the model.
 
 _PROC = psutil.Process(os.getpid())
 
@@ -72,7 +64,11 @@ def get_cpu_ram_snapshot():
     return p_cpu, rss_mb, sys_cpu, sys_mem
 
 def update_gpu_maxima(max_gpu_util, max_gpu_mem_used):
-    """Update dicts with max GPU util% and VRAM used (MB) per device index."""
+    """Keep track of the highest GPU util% and VRAM usage seen so far, per GPU.
+
+    Called repeatedly during validation, so these dicts just get overwritten
+    with a bigger number whenever we see one.
+    """
     if not torch.cuda.is_available():
         return
     try:
@@ -198,15 +194,15 @@ class ValResourceCallback:
         }
 
 def run_validation_with_metrics(weights_path, data_yaml, imgsz=640, batch=16, device="cuda", half=True, workers=4, out_dir="val_monitor"):
-    """Run Ultralytics model.val() with resource/timing callbacks, save to out_dir."""
+    """Run model.val() on one set of weights and write the resource + metrics files."""
     from ultralytics import YOLO
 
     cb = ValResourceCallback()
 
     model = YOLO(weights_path)
 
-    # Register callbacks via the public API to support Ultralytics versions that
-    # do not accept 'callbacks=' in model.val/train.
+    # Registering callbacks this way instead of passing callbacks= to model.val()
+    # because some Ultralytics versions don't accept that kwarg.
     for event, fn in [
         ("on_val_start", cb.on_val_start),
         ("on_val_batch_start", cb.on_val_batch_start),
@@ -244,10 +240,10 @@ def run_validation_with_metrics(weights_path, data_yaml, imgsz=640, batch=16, de
 
     return cb.summary, out_dir
 
-# --------------------------- Main (validation only) --------------------------
+# Everything below is the actual validation-only run, no training happens here.
 
 def main():
-    # ====== USER CONFIG (based on your prior setup) ======
+    # Change these if the run layout or dataset config moves.
     DATA_YAML = "dataset_paper_new/data_nano_rev.yaml"
     VAL_BATCH = 16
     IMGSZ = 640
@@ -255,11 +251,10 @@ def main():
     PROJECT = "runs_2/train"
     NAME_PREFIX = "YOLO_noD_Reversed_lr"
     USE_HALF_FOR_VAL = True
-    # Pick the LRs for which you already have trained runs:
+    # These are the learning rates I already have trained weights for.
     LEARNING_RATES = [0.1, 0.01, 0.001, 0.0001, 0.00001]
-    # Which weight file to prefer
-    PREFER_WEIGHTS = "best.pt"     # fallback to last.pt if best doesn't exist
-    # =====================================================
+    # Prefer best.pt, but last.pt works too if best wasn't saved for some reason.
+    PREFER_WEIGHTS = "best.pt"
 
     project_dir = Path(PROJECT)
     project_dir.mkdir(parents=True, exist_ok=True)
